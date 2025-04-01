@@ -10,22 +10,11 @@
         using DiskBinaryTree tree = new DiskBinaryTree(path);
 
         tree.Insert(10);
-        tree.Insert(30);
-        tree.Insert(1);
-        tree.Insert(11);
-        tree.Insert(100);
-        tree.Insert(5);
-        tree.Insert(9);
+        Console.WriteLine(tree.Delete(10));
+
+        tree.Insert(20);
 
         tree.Print();
-
-        //TODO: add search method
-        //TODO:  add delete method
-        //TODO:  add unit tests
-
-        //TODO:  add concurrency support
-
-
 
     }
 }

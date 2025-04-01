@@ -1,4 +1,6 @@
-﻿public class DiskBinaryTree : IDisposable
+﻿using System.Collections.Concurrent;
+
+public class DiskBinaryTree : IDisposable
 {
     private readonly FileStream _stream;
     private readonly BinaryWriter _writer;
@@ -9,6 +11,12 @@
     /// </summary>
     private const int NodeSizeOnDisk = 20; // 4(int) + 8(long) + 8(long)
 
+    /// <summary>
+    /// list of free offsets 
+    /// used to reuse the space
+    /// </summary>
+    private ConcurrentQueue<long> _freeOffsets = new();
+
     public DiskBinaryTree(string filePath)
     {
         _stream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite);
@@ -16,13 +24,58 @@
         _reader = new BinaryReader(_stream);
     }
 
-    public void Insert(int value)
+    /// <summary>
+    /// Check if the value is in the tree.
+    /// </summary>
+    /// <param name="value"></param>
+    /// <returns>return true if the value present in the tree otherwise false.</returns>
+    public bool Contains(int value)
     {
-        _stream.Seek(0, SeekOrigin.Begin);
-        InsertRecursive(value);
+        try
+        {
+            Seek(value);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
-    private void InsertRecursive(int value)
+    public long Seek(int value)
+    {
+        long offset = 0;
+        _stream.Seek(offset, SeekOrigin.Begin);
+        try
+        {
+            while (true)
+            {
+                Node node = ReadNode(offset);
+                if (node.Value == value)
+                {
+                    return offset;
+                }
+                if (node.Value > value)
+                {
+                    offset = node.LeftOffset;
+                }
+                else
+                {
+                    offset = node.RightOffset;
+                }
+                if (offset == 0)
+                {
+                    throw new Exception("Value not found");
+                }
+            }
+        }
+        catch (EndOfStreamException)
+        {
+        }
+        throw new Exception("Value not found");
+    }
+
+    public void Insert(int value)
     {
         if (_stream.Length == 0)
         {
@@ -31,77 +84,79 @@
             return;
         }
 
-        var node = ReadNode(_stream.Position);
+        long offset = 0;
 
-        if (node.Value > value)
+        while (true)
         {
-            if (node.LeftOffset == 0)
+            var node = ReadNode(offset);
+
+            if (node.Value > value)
             {
-                node.LeftOffset = Write(Node.Create(value));
-                Update(node);
-            }
-            else if (ReadNode(node.LeftOffset).Value > value)
-            {
-                _stream.Seek(node.LeftOffset, SeekOrigin.Begin);
-                InsertRecursive(value);
+                if (node.LeftOffset == 0)
+                {
+                    node.LeftOffset = Write(Node.Create(value));
+                    Update(node);
+                    return;
+                }
+                else if (ReadNode(node.LeftOffset).Value > value)
+                {
+                    offset = node.LeftOffset;
+                }
+                else
+                {
+                    Node newNode = Node.Create(value);
+                    newNode.LeftOffset = ReadNode(node.LeftOffset).Offset;
+                    newNode.Offset = Write(newNode);
+                    node.LeftOffset = newNode.Offset;
+                    Update(node);
+                    return;
+
+                }
             }
             else
             {
-                Node newNode = Node.Create(value);
-                newNode.LeftOffset = ReadNode(node.LeftOffset).Offset;
-                newNode.Offset = Write(newNode);
-                node.LeftOffset = newNode.Offset;
-                Update(node);
+                if (node.RightOffset == 0)
+                {
+                    node.RightOffset = Write(Node.Create(value));
+                    Update(node);
+                    return;
+                }
+                else if (ReadNode(node.RightOffset).Value < value)
+                {
+                    offset = node.RightOffset;
+                }
+                else
+                {
+                    Node newNode = Node.Create(value);
+                    newNode.RightOffset = ReadNode(node.RightOffset).Offset;
+                    newNode.Offset = Write(newNode);
+                    node.RightOffset = newNode.Offset;
+                    Update(node);
+                    return;
+                }
             }
         }
-        else
+    }
+
+    public bool Delete(int value)
+    {
+        try
         {
-            if (node.RightOffset == 0)
+            long offset = Seek(value);
+            Node node = ReadNode(offset);
+            if (node.LeftOffset == 0 && node.RightOffset == 0)
             {
-                node.RightOffset = Write(Node.Create(value));
-                Update(node);
+                _freeOffsets.Enqueue(offset);
+                return true;
             }
-            else if (ReadNode(node.RightOffset).Value < value)
-            {
-                _stream.Seek(node.RightOffset, SeekOrigin.Begin);
-                InsertRecursive(value);
-            }
-            else
-            {
-                Node newNode = Node.Create(value);
-                newNode.RightOffset = ReadNode(node.RightOffset).Offset;
-                newNode.Offset = Write(newNode);
-                node.RightOffset = newNode.Offset;
-                Update(node);
-            }
+
+            throw new NotImplementedException();
         }
-
+        catch (Exception)
+        {
+            return false;
+        }
     }
-
-    public void Update(Node node)
-    {
-        _stream.Seek(node.Offset, SeekOrigin.Begin);
-        _writer.Write(node.Value);
-        _writer.Write(node.LeftOffset);
-        _writer.Write(node.RightOffset);
-        _writer.Flush();
-    }
-
-    public long Write(Node node)
-    {
-        _stream.Lock(0, NodeSizeOnDisk);
-
-        _stream.Seek(0, SeekOrigin.End);
-        long currentPosition = _stream.Position;
-        _writer.Write(node.Value);
-        _writer.Write(node.LeftOffset);
-        _writer.Write(node.RightOffset);
-        _writer.Flush();
-
-        _stream.Unlock(0, NodeSizeOnDisk);
-        return currentPosition;
-    }
-
 
     public void Print()
     {
@@ -123,12 +178,40 @@
         }
     }
 
+    private void Update(Node node)
+    {
+        _stream.Seek(node.Offset, SeekOrigin.Begin);
+        _writer.Write(node.Value);
+        _writer.Write(node.LeftOffset);
+        _writer.Write(node.RightOffset);
+        _writer.Flush();
+    }
+
+    private long Write(Node node)
+    {
+        if (_freeOffsets.TryDequeue(out long freeOffset))
+        {
+            _stream.Seek(freeOffset, SeekOrigin.Begin);
+        }
+        else
+        {
+            _stream.Seek(0, SeekOrigin.End);
+        }
+
+        long currentPosition = _stream.Position;
+        _writer.Write(node.Value);
+        _writer.Write(node.LeftOffset);
+        _writer.Write(node.RightOffset);
+        _writer.Flush();
+
+        return currentPosition;
+    }
 
     /// <summary>
     /// format: value, leftOffset, rightOffset
     /// </summary>
     /// <returns></returns>
-    public Node ReadNode(long offset)
+    private Node ReadNode(long offset)
     {
         _stream.Seek(offset, SeekOrigin.Begin);
         return new Node(
@@ -137,7 +220,6 @@
             leftOffset: _reader.ReadInt64(),
             rightOffset: _reader.ReadInt64());
     }
-
 
     public void Dispose()
     {
